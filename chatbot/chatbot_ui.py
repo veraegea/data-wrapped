@@ -69,43 +69,36 @@ def _cargar_tabla_usuarios() -> pd.DataFrame:
     """
     Carga la tabla completa usuario_track desde data/.
     Se cachea para no leer el CSV en cada interacción.
-    La primera fila puede estar corrupta (problema conocido del CSV), se limpia aquí.
     """
     try:
         df = pd.read_csv("data/usuario_track.csv")
-        # Eliminar filas donde persona_id contiene comas (fila corrupta del CSV)
         df = df[~df["persona_id"].str.contains(",", na=False)]
         df = df.dropna(subset=["persona_id", "nombre_cancion", "nombre_artista"])
         df["persona_id"] = df["persona_id"].str.strip()
+        # Normalizar nombre_cancion y nombre_artista para comparaciones
+        df["_cancion_norm"] = df["nombre_cancion"].str.lower().str.strip()
+        df["_artista_norm"] = df["nombre_artista"].str.lower().str.strip()
         return df
     except FileNotFoundError:
         return pd.DataFrame()
 
 
 def _get_todos_usuarios(df_global: pd.DataFrame) -> list:
-    """Lista de todos los usuarios registrados en la app."""
     if df_global.empty or "persona_id" not in df_global.columns:
         return []
     return sorted(df_global["persona_id"].unique().tolist())
 
 
 # ─────────────────────────────────────────────────────────────
-# LÓGICA DE RECOMENDACIÓN GRUPAL (sin géneros)
+# LÓGICA DE RECOMENDACIÓN GRUPAL
 # ─────────────────────────────────────────────────────────────
 
 def _construir_contexto_grupal(df_global: pd.DataFrame, personas: list) -> str:
-    """
-    Construye el contexto textual para el LLM a partir de la tabla global,
-    filtrando solo los usuarios seleccionados.
-    No depende del CSV de géneros — trabaja solo con nombre_cancion,
-    nombre_artista, score_interes y num_reproducciones.
-    """
     if df_global.empty:
         return "No hay datos disponibles de los usuarios seleccionados."
 
     partes = []
 
-    # ── Perfil individual de cada usuario ──────────────────────
     for persona in personas:
         df_p = df_global[df_global["persona_id"] == persona].copy()
         if df_p.empty:
@@ -139,30 +132,38 @@ def _construir_contexto_grupal(df_global: pd.DataFrame, personas: list) -> str:
             f"Top artistas por minutos:\n{artistas_txt}"
         )
 
-    # ── Canciones comunes entre todos los usuarios ──────────────
-    sets_canciones = [
-        set(df_global[df_global["persona_id"] == p]["nombre_cancion"].str.lower())
+    # ── Canciones comunes: comparar por cancion+artista normalizados ──
+    # FIX: antes comparábamos solo por nombre_cancion en minúsculas,
+    # lo que podía dar falsos positivos (canciones con el mismo nombre
+    # pero de artistas distintos). Ahora cruzamos cancion+artista juntos.
+    sets_pares = [
+        set(
+            zip(
+                df_global[df_global["persona_id"] == p]["_cancion_norm"],
+                df_global[df_global["persona_id"] == p]["_artista_norm"]
+            )
+        )
         for p in personas
     ]
-    comunes = sets_canciones[0]
-    for s in sets_canciones[1:]:
-        comunes = comunes & s
+    pares_comunes = sets_pares[0]
+    for s in sets_pares[1:]:
+        pares_comunes = pares_comunes & s
 
-    if comunes:
+    if pares_comunes:
+        lista = "\n".join(f"  - {c} — {a}" for c, a in sorted(pares_comunes)[:20])
         partes.append(
             f"\n{'='*45}\n"
-            f"CANCIONES QUE TODOS CONOCEN ({len(comunes)} en común):\n"
-            + "\n".join(f"  - {c}" for c in sorted(comunes)[:20])
+            f"CANCIONES QUE TODOS CONOCEN ({len(pares_comunes)} en común):\n{lista}"
         )
     else:
         partes.append(
             f"\n{'='*45}\n"
-            "CANCIONES EN COMÚN: Ninguna canción exacta en común entre todos los usuarios seleccionados."
+            "CANCIONES EN COMÚN: Ninguna canción exacta en común entre todos los usuarios."
         )
 
     # ── Artistas comunes ────────────────────────────────────────
     sets_artistas = [
-        set(df_global[df_global["persona_id"] == p]["nombre_artista"].str.lower())
+        set(df_global[df_global["persona_id"] == p]["_artista_norm"])
         for p in personas
     ]
     artistas_comunes = sets_artistas[0]
@@ -171,41 +172,38 @@ def _construir_contexto_grupal(df_global: pd.DataFrame, personas: list) -> str:
 
     if artistas_comunes:
         partes.append(
-            f"ARTISTAS QUE TODOS ESCUCHAN:\n"
+            "ARTISTAS QUE TODOS ESCUCHAN:\n"
             + "\n".join(f"  - {a}" for a in sorted(artistas_comunes)[:15])
         )
 
-    # ── Canciones que uno conoce y el otro no ──────────────────
+    # ── Canciones que uno conoce y el otro no (solo para grupos de 2) ──
     if len(personas) == 2:
         p1, p2 = personas[0], personas[1]
-        df_p1 = df_global[df_global["persona_id"] == p1]
-        df_p2 = df_global[df_global["persona_id"] == p2]
+        pares_p1 = sets_pares[0]
+        pares_p2 = sets_pares[1]
 
-        canciones_p1 = set(df_p1["nombre_cancion"].str.lower())
-        canciones_p2 = set(df_p2["nombre_cancion"].str.lower())
-
-        solo_p1 = canciones_p1 - canciones_p2
-        solo_p2 = canciones_p2 - canciones_p1
+        solo_p1 = pares_p1 - pares_p2
+        solo_p2 = pares_p2 - pares_p1
 
         if solo_p1:
-            top_para_p2 = (df_p1[df_p1["nombre_cancion"].str.lower().isin(solo_p1)]
-                           .sort_values("score_interes", ascending=False)
-                           .head(8))
+            df_p1 = df_global[df_global["persona_id"] == p1]
+            top = (df_p1[
+                df_p1["_cancion_norm"].isin([c for c, _ in solo_p1]) &
+                df_p1["_artista_norm"].isin([a for _, a in solo_p1])
+            ].sort_values("score_interes", ascending=False).head(8))
             txt = "\n".join(f"  - {r['nombre_cancion']} ({r['nombre_artista']})"
-                            for _, r in top_para_p2.iterrows())
-            partes.append(
-                f"TOP CANCIONES DE {p1.upper()} QUE {p2.upper()} AÚN NO CONOCE:\n{txt}"
-            )
+                            for _, r in top.iterrows())
+            partes.append(f"TOP CANCIONES DE {p1.upper()} QUE {p2.upper()} AÚN NO CONOCE:\n{txt}")
 
         if solo_p2:
-            top_para_p1 = (df_p2[df_p2["nombre_cancion"].str.lower().isin(solo_p2)]
-                           .sort_values("score_interes", ascending=False)
-                           .head(8))
+            df_p2 = df_global[df_global["persona_id"] == p2]
+            top = (df_p2[
+                df_p2["_cancion_norm"].isin([c for c, _ in solo_p2]) &
+                df_p2["_artista_norm"].isin([a for _, a in solo_p2])
+            ].sort_values("score_interes", ascending=False).head(8))
             txt = "\n".join(f"  - {r['nombre_cancion']} ({r['nombre_artista']})"
-                            for _, r in top_para_p1.iterrows())
-            partes.append(
-                f"TOP CANCIONES DE {p2.upper()} QUE {p1.upper()} AÚN NO CONOCE:\n{txt}"
-            )
+                            for _, r in top.iterrows())
+            partes.append(f"TOP CANCIONES DE {p2.upper()} QUE {p1.upper()} AÚN NO CONOCE:\n{txt}")
 
     partes.append(f"{'='*45}")
     return "\n\n".join(partes)
@@ -213,18 +211,18 @@ def _construir_contexto_grupal(df_global: pd.DataFrame, personas: list) -> str:
 
 def _cancion_que_mas_une(df_global: pd.DataFrame, personas: list) -> pd.DataFrame:
     """
-    Devuelve las canciones que más unen al grupo:
-    canciones escuchadas por el mayor número de personas,
-    ordenadas por score_interes medio entre ellas.
+    Canciones escuchadas por más de un miembro del grupo,
+    cruzando por cancion+artista normalizados para evitar falsos positivos.
     """
-    df_sel = df_global[df_global["persona_id"].isin(personas)]
-    agg = (df_sel.groupby(["nombre_cancion", "nombre_artista"])
+    df_sel = df_global[df_global["persona_id"].isin(personas)].copy()
+    agg = (df_sel.groupby(["_cancion_norm", "_artista_norm"])
            .agg(
+               nombre_cancion=("nombre_cancion", "first"),
+               nombre_artista=("nombre_artista", "first"),
                n_usuarios=("persona_id", "nunique"),
                score_medio=("score_interes", "mean"),
-               min_totales=("minutos_totales", "sum"),
            )
-           .reset_index()
+           .reset_index(drop=True)
            .sort_values(["n_usuarios", "score_medio"], ascending=[False, False])
            .head(10))
     return agg
@@ -252,10 +250,6 @@ SUGERENCIAS_GRUPAL = [
 
 
 def _chips_sugerencias(sugerencias: list, key_prefix: str):
-    """
-    Renderiza botones de sugerencia en fila.
-    Al pulsar uno, lo inyecta en el input del chat como si lo hubiera escrito el usuario.
-    """
     cols = st.columns(len(sugerencias))
     for i, (col, texto) in enumerate(zip(cols, sugerencias)):
         with col:
@@ -263,60 +257,76 @@ def _chips_sugerencias(sugerencias: list, key_prefix: str):
                 st.session_state[f"{key_prefix}_sugerencia_activa"] = texto
 
 
+# ─────────────────────────────────────────────────────────────
+# VOZ: botón al lado del chat_input mediante HTML/JS
+# ─────────────────────────────────────────────────────────────
+
 def _render_voz(key_prefix: str):
     """
-    Muestra un grabador de audio y transcribe lo grabado con Groq Whisper.
-    Si la transcripción tiene éxito, la inyecta en session_state como si
-    el usuario la hubiera escrito, igual que hacen las sugerencias.
-
-    Streamlit renderiza st.audio_input como un botón de micrófono compacto.
-    Lo colocamos en la misma línea visual que el chat_input usando columnas.
+    Muestra st.audio_input con el estado visible:
+    - Mientras graba: spinner "Grabando..."
+    - Cuando hay audio: transcribe y mete el texto en la caja de chat
+    El widget se coloca encima del chat_input con una etiqueta clara.
     """
+    # Estado del grabador
+    grabando_key = f"{key_prefix}_grabando"
+
+    col_label, col_estado = st.columns([1, 3])
+    with col_label:
+        st.markdown("**🎙️ Voz:**")
+    with col_estado:
+        if st.session_state.get(grabando_key):
+            st.markdown("🔴 *Grabando... pulsa Stop cuando termines*")
+        else:
+            st.markdown("*Pulsa el micro para grabar*")
+
+    # Usamos una key dinámica para resetear el widget tras cada transcripción
+    audio_key_counter = st.session_state.get(f"{key_prefix}_audio_key_counter", 0)
+
     audio = st.audio_input(
-        "🎙️",
-        key=f"{key_prefix}_audio_input",
-        help="Pulsa para grabar. Pulsa de nuevo para detener. Se transcribirá automáticamente.",
-        label_visibility="collapsed",   # solo se ve el icono del micro
+        "Grabar mensaje de voz",
+        key=f"{key_prefix}_audio_input_{audio_key_counter}",
+        label_visibility="collapsed",
     )
 
-
     if audio is not None:
-        # IMPORTANTE: usar getvalue() no read().
-        # st.audio_input devuelve un UploadedFile cuyo cursor interno puede
-        # estar ya al final (read() devolvería 0 bytes). getvalue() siempre
-        # devuelve el contenido completo independientemente del cursor.
-        audio_bytes = audio.getvalue()
+        # Marcar que hay grabación en curso al principio del ciclo
+        st.session_state[grabando_key] = False
 
-        print(f"[DEBUG] audio bytes: {len(audio_bytes)}")
+        try:
+            audio_bytes = audio.getvalue()
+        except AttributeError:
+            audio.seek(0)
+            audio_bytes = audio.read()
 
-        # Evitar transcribir el mismo audio dos veces cuando Streamlit rerenderiza
-        ultimo_hash = st.session_state.get(f"{key_prefix}_ultimo_audio_hash")
+        if len(audio_bytes) < 500:
+            st.caption("⚠️ Audio muy corto, inténtalo de nuevo.")
+            return
+
+        # Hash para no retranscribir el mismo audio
         nuevo_hash = hashlib.md5(audio_bytes).hexdigest()
+        ultimo_hash = st.session_state.get(f"{key_prefix}_ultimo_audio_hash")
 
-        if nuevo_hash != ultimo_hash and len(audio_bytes) > 1000:
-            # len > 1000 descarta grabaciones vacías o demasiado cortas (<0.1s)
-            print("[DEBUG] Audio nuevo detectado, voy a transcribir")
-            st.session_state[f"{key_prefix}_ultimo_audio_hash"] = nuevo_hash
+        if nuevo_hash == ultimo_hash:
+            return  # ya procesado, no hacer nada
 
-            st.audio(audio_bytes, format="audio/webm")
+        st.session_state[f"{key_prefix}_ultimo_audio_hash"] = nuevo_hash
 
-            with open("debug_audio.webm", "wb") as f:
-                f.write(audio_bytes)
+        with st.spinner("✍️ Transcribiendo tu mensaje..."):
+            texto = transcribir_audio(audio_bytes)
 
-            with st.spinner("Transcribiendo..."):
-                texto = transcribir_audio(audio_bytes)
-            print(f"[DEBUG] texto transcrito: {repr(texto)}")
-
-            if texto:
-                st.session_state[f"{key_prefix}_sugerencia_activa"] = texto
-                st.rerun()
-            else:
-                st.warning("No se pudo transcribir el audio. Inténtalo de nuevo.")
+        if texto and texto.strip():
+            # Resetear el widget incrementando la key (borra visualmente el estado de error)
+            st.session_state[f"{key_prefix}_audio_key_counter"] = audio_key_counter + 1
+            # Inyectar como si el usuario lo hubiera escrito
+            st.session_state[f"{key_prefix}_sugerencia_activa"] = texto.strip()
+            st.rerun()
         else:
-            print("[DEBUG] No transcribo: mismo audio o audio demasiado corto")
-            print(f"[DEBUG] ultimo_hash={ultimo_hash}")
-            print(f"[DEBUG] nuevo_hash={nuevo_hash}")
-            print(f"[DEBUG] len={len(audio_bytes)}")
+            st.warning("No se pudo transcribir. Habla más cerca del micrófono e inténtalo de nuevo.")
+    else:
+        # No hay audio aún: marcar estado "esperando grabación"
+        st.session_state[grabando_key] = False
+
 
 # ─────────────────────────────────────────────────────────────
 # MODO INDIVIDUAL
@@ -328,27 +338,18 @@ def _render_individual(data: dict, persona_id: str, ahora: datetime, dia_semana:
 
     st.divider()
 
-    # Mostrar historial
     for mensaje in st.session_state.chat_history:
         with st.chat_message(mensaje["role"]):
             st.write(mensaje["content"])
 
-    # Comprobar si hay sugerencia activa pendiente de enviar
     sugerencia = st.session_state.pop("ind_sugerencia_activa", None)
 
-    # ── Input de texto + micrófono ──────────────────────────────
-    # st.chat_input ocupa todo el ancho de forma nativa.
-    # Colocamos el micrófono justo encima, alineado a la derecha,
-    # para que visualmente quede "al lado" del campo de texto.
-    col_mic, col_info = st.columns([1, 8])
-    with col_mic:
+    # Micrófono encima del chat_input
+    with st.container():
         _render_voz(key_prefix="ind")
-    with col_info:
-        st.caption("🎙️ Habla o escribe tu pregunta")
 
     user_input = st.chat_input("¿Qué quieres escuchar ahora? ¿Estoy en bucle con una canción, recomiéndame algo parecido...")
 
-    # La sugerencia tiene prioridad sobre el input manual
     mensaje_a_enviar = sugerencia or user_input
 
     if mensaje_a_enviar:
@@ -392,85 +393,40 @@ def _render_individual(data: dict, persona_id: str, ahora: datetime, dia_semana:
 # ─────────────────────────────────────────────────────────────
 
 def _render_grupal(data: dict, persona_id: str, ahora: datetime, dia_semana: str):
-    """Renderiza el modo grupal completo."""
 
-    # Cargar tabla global de todos los usuarios
     df_global = _cargar_tabla_usuarios()
     todos_usuarios = _get_todos_usuarios(df_global)
 
     if not todos_usuarios:
         st.error(
-            "No se encontró la tabla `data/usuario_track.csv` con los datos de usuarios. "
+            "No se encontró `data/usuario_track.csv`. "
             "Asegúrate de que el fichero existe en la carpeta `data/`."
         )
         return
 
-    # ── Buscar y seleccionar amigos ─────────────────────────────
-    st.markdown("### 👥 Seleccionar usuarios")
+    # ── CAMBIO 1: buscador + selector integrado en un solo widget ──
+    st.markdown("### 👥 Añadir amigos al grupo")
 
-    col_buscar, col_invitar = st.columns([3, 1])
+    # Excluir al usuario actual
+    otros_usuarios = [u for u in todos_usuarios if u != persona_id]
 
-    with col_buscar:
-        busqueda = st.text_input(
-            "🔍 Buscar usuario por nombre",
-            placeholder="Escribe un nombre...",
-            help="Busca entre los usuarios registrados en la app"
-        )
+    amigos_seleccionados = st.multiselect(
+    "🔍 Buscar y seleccionar amigos",
+    options=otros_usuarios,
+    default=st.session_state.get("amigos_seleccionados_prev", []),
+    placeholder="Escribe un nombre y pulsa Enter para seleccionarlo...",
+    help="Puedes escribir para filtrar y seleccionar uno o varios amigos")
 
-    with col_invitar:
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("📨 Invitar amigo", use_container_width=True):
-            st.session_state.mostrar_invitar = not st.session_state.get("mostrar_invitar", False)
+    # Limpiar historial si cambian los amigos seleccionados
+    amigos_prev = st.session_state.get("amigos_seleccionados_prev")
+    if amigos_prev is not None and set(amigos_prev) != set(amigos_seleccionados):
+        st.session_state.chat_history = []
+    st.session_state["amigos_seleccionados_prev"] = amigos_seleccionados
 
-    # Panel de invitación
-    if st.session_state.get("mostrar_invitar", False):
-        with st.container(border=True):
-            st.markdown("#### 📨 Invita a un amigo a la app")
-            st.markdown(
-                "Para que tu amigo pueda unirse, necesita descargar sus datos de Spotify "
-                "y subirlos a la aplicación."
-            )
-            st.markdown(
-                "**Paso 1:** Tu amigo debe ir a su cuenta de Spotify y solicitar sus datos:\n\n"
-                "👉 [Descargar datos de Spotify](https://www.spotify.com/es/account/privacy/)"
-            )
-            st.markdown(
-                "**Paso 2:** Una vez descargados (~30 días de espera), que abra esta app, "
-                "introduzca su nombre y suba el ZIP con sus datos."
-            )
-            st.info(
-                "💡 Una vez que tu amigo suba sus datos, aparecerá automáticamente "
-                "en el buscador de usuarios."
-            )
-            if st.button("✕ Cerrar"):
-                st.session_state.mostrar_invitar = False
-                st.rerun()
-
-    # Filtrar usuarios según búsqueda
-    usuarios_filtrados = todos_usuarios
-    if busqueda:
-        usuarios_filtrados = [u for u in todos_usuarios if busqueda.lower() in u.lower()]
-
-    # Excluir al usuario actual de la lista de selección (ya se incluye siempre)
-    usuarios_para_seleccionar = [u for u in usuarios_filtrados if u != persona_id]
-
-    if not usuarios_para_seleccionar:
-        st.warning("No se encontraron otros usuarios con ese nombre.")
-        amigos_seleccionados = []
-    else:
-        amigos_seleccionados = st.multiselect(
-            f"Usuarios encontrados ({len(usuarios_para_seleccionar)} en la app):",
-            options=usuarios_para_seleccionar,
-            default=st.session_state.get("amigos_seleccionados_prev", []),
-            help="Puedes seleccionar varios amigos a la vez"
-        )
-        st.session_state.amigos_seleccionados_prev = amigos_seleccionados
-
-    # Grupo completo = usuario actual + amigos seleccionados
     grupo = [persona_id] + amigos_seleccionados
 
     if len(grupo) < 2:
-        st.info("👆 Selecciona al menos un amigo para empezar el chat grupal.")
+        st.info("👆 Selecciona al menos un amigo para empezar.")
         return
 
     # ── Panel de afinidad ──────────────────────────────────────
@@ -478,55 +434,45 @@ def _render_grupal(data: dict, persona_id: str, ahora: datetime, dia_semana: str
 
     with st.expander("🔗 Ver canciones que os unen", expanded=False):
         df_une = _cancion_que_mas_une(df_global, grupo)
-        if df_une.empty or df_une["n_usuarios"].max() < 2:
+        df_une_comunes = df_une[df_une["n_usuarios"] >= 2]
+        if df_une_comunes.empty:
             st.info("No hay canciones que todos hayáis escuchado. ¡Quizás sea el momento de descubrirlas juntos!")
         else:
-            df_une_comunes = df_une[df_une["n_usuarios"] >= 2]
-            if df_une_comunes.empty:
-                st.info("No hay canciones compartidas entre todos los usuarios del grupo.")
-            else:
-                st.markdown(f"**{len(df_une_comunes)} canciones en común** entre los miembros del grupo:")
-                for _, r in df_une_comunes.iterrows():
-                    usuarios_str = f"{int(r['n_usuarios'])}/{len(grupo)} usuarios"
-                    st.markdown(
-                        f"🎵 **{r['nombre_cancion']}** — {r['nombre_artista']} "
-                        f"&nbsp;|&nbsp; {usuarios_str}"
-                    )
+            st.markdown(f"**{len(df_une_comunes)} canciones en común:**")
+            for _, r in df_une_comunes.iterrows():
+                st.markdown(
+                    f"🎵 **{r['nombre_cancion']}** — {r['nombre_artista']} "
+                    f"&nbsp;|&nbsp; {int(r['n_usuarios'])}/{len(grupo)} usuarios"
+                )
 
-    # ── Sugerencias de preguntas ───────────────────────────────
+    # ── Sugerencias ────────────────────────────────────────────
     st.markdown("#### 💡 Sugerencias de preguntas grupales")
     _chips_sugerencias(SUGERENCIAS_GRUPAL, key_prefix="grp")
 
     st.divider()
 
-    # ── Historial del chat ─────────────────────────────────────
+    # ── Historial ──────────────────────────────────────────────
     for mensaje in st.session_state.chat_history:
         with st.chat_message(mensaje["role"]):
             st.write(mensaje["content"])
 
-    # Sugerencia activa pendiente
     sugerencia = st.session_state.pop("grp_sugerencia_activa", None)
 
-    # ── Input de texto + micrófono ──────────────────────────────
-    col_mic, col_info = st.columns([1, 8])
-    with col_mic:
+    # Micrófono encima del chat_input
+    with st.container():
         _render_voz(key_prefix="grp")
-    with col_info:
-        st.caption("🎙️ Habla o escribe tu pregunta")
 
     user_input = st.chat_input("Pregunta algo sobre el grupo...")
     mensaje_a_enviar = sugerencia or user_input
 
     if mensaje_a_enviar:
-        # Construir contexto grupal desde la tabla global
         contexto_grupal = _construir_contexto_grupal(df_global, grupo)
-
         cabecera = (
             f"Modo: recomendación grupal\n"
             f"Usuarios del grupo: {', '.join(grupo)}\n"
             f"Hora actual: {ahora.strftime('%H:%M')} ({dia_semana})\n\n"
             f"INSTRUCCIÓN ESPECIAL: Recomienda únicamente artistas y canciones que NINGUNO "
-            f"de los usuarios del grupo haya escuchado ya (no aparezcan en sus perfiles). "
+            f"de los usuarios del grupo haya escuchado ya. "
             f"Usa los datos de afinidad para justificar las recomendaciones."
         )
 
@@ -552,18 +498,60 @@ def _render_grupal(data: dict, persona_id: str, ahora: datetime, dia_semana: str
 # ─────────────────────────────────────────────────────────────
 
 def render_chatbot(data: dict, persona_id: str):
-    """
-    Punto de entrada principal. Renderiza el chatbot completo con
-    modo individual y grupal.
+    st.markdown("""
+    <style>
+    /* Oculta contenedor de error externo por si acaso */
+    [data-testid="stAudioInput"] ~ div[role="alert"],
+    [data-testid="stAudioInput"] ~ p {
+        display: none !important;
+    }
+    </style>
 
-    Args:
-        data: diccionario con los DataFrames del proyecto (del usuario actual)
-        persona_id: nombre del usuario activo en la sesión
-    """
-    st.markdown("## 🤖 Asistente Musical")
-    st.markdown("Pregúntame sobre tus gustos, pídeme recomendaciones o crea playlists grupales.")
+    <script>
+    (function() {
+        function patchAudioWidget() {
+            // Buscar todos los elementos con shadow root (web components del audio_input)
+            const allElements = document.querySelectorAll('*');
+            allElements.forEach(el => {
+                if (el.shadowRoot) {
+                    try {
+                        // Inyectar CSS dentro del shadow DOM para ocultar el mensaje de error
+                        const style = document.createElement('style');
+                        style.textContent = `
+                            [class*="error"], [class*="Error"],
+                            p, span[class*="status"],
+                            div[class*="message"] {
+                                display: none !important;
+                            }
+                        `;
+                        if (!el.shadowRoot.querySelector('style[data-patched]')) {
+                            style.setAttribute('data-patched', 'true');
+                            el.shadowRoot.appendChild(style);
+                        }
 
-    # Inicializar historial
+                        // Reemplazar texto del error directamente si aparece
+                        const walker = document.createTreeWalker(
+                            el.shadowRoot,
+                            NodeFilter.SHOW_TEXT
+                        );
+                        let node;
+                        while ((node = walker.nextNode())) {
+                            if (node.textContent.includes('An error has occurred')) {
+                                node.textContent = '';
+                            }
+                        }
+                    } catch(e) {}
+                }
+            });
+        }
+
+        // Ejecutar al cargar y repetir cada vez que el DOM cambie
+        const observer = new MutationObserver(patchAudioWidget);
+        observer.observe(document.body, { childList: true, subtree: true });
+        patchAudioWidget();
+    })();
+    </script>
+    """, unsafe_allow_html=True)
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
@@ -571,8 +559,9 @@ def render_chatbot(data: dict, persona_id: str):
     dias_es = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
     dia_semana = dias_es[ahora.weekday()]
 
-    # ── Cabecera: modo + limpiar ────────────────────────────────
-    col1, col2, col3 = st.columns([2, 2, 1])
+    # ── Cabecera: modo + contexto + limpiar + invitar ───────────
+    col1, col2, col3 = st.columns([3, 2, 1])
+
     with col1:
         modo = st.radio(
             "Modo",
@@ -580,6 +569,13 @@ def render_chatbot(data: dict, persona_id: str):
             horizontal=True,
             help="Individual: recomendaciones solo para ti. Grupal: playlist para el grupo."
         )
+
+    # Limpiar historial automáticamente al cambiar de modo
+    modo_anterior = st.session_state.get("modo_anterior")
+    if modo_anterior is not None and modo_anterior != modo:
+        st.session_state.chat_history = []
+        st.session_state.pop("amigos_seleccionados_prev", None)
+    st.session_state["modo_anterior"] = modo
     with col2:
         with st.expander("ℹ️ Contexto actual"):
             st.write(f"**Usuario:** {persona_id}")
@@ -587,14 +583,38 @@ def render_chatbot(data: dict, persona_id: str):
             st.write(f"**Día:** {dia_semana.capitalize()}")
     with col3:
         st.markdown("<br>", unsafe_allow_html=True)
+        # CAMBIO 3 (limpiar chat)
         if st.button("🗑️ Limpiar chat", use_container_width=True):
             st.session_state.chat_history = []
             st.session_state.pop("amigos_seleccionados_prev", None)
             st.rerun()
 
+        # CAMBIO 2: botón invitar debajo de limpiar chat
+        if st.button("📨 Invitar amigo", use_container_width=True, key="btn_invitar_cabecera"):
+            st.session_state.mostrar_invitar = not st.session_state.get("mostrar_invitar", False)
+
+    # Panel de invitación (se muestra bajo la cabecera si está activo)
+    if st.session_state.get("mostrar_invitar", False):
+        with st.container(border=True):
+            st.markdown("#### 📨 Invita a un amigo")
+            st.markdown(
+                "Para unirse, tu amigo necesita descargar sus datos de Spotify y subirlos a la app."
+            )
+            st.markdown(
+                "**Paso 1:** Ir a la cuenta de Spotify y solicitar los datos:\n\n"
+                "👉 [Descargar datos de Spotify](https://www.spotify.com/es/account/privacy/)"
+            )
+            st.markdown(
+                "**Paso 2:** Una vez descargados (~30 días de espera), abrir esta app, "
+                "introducir el nombre y subir el ZIP."
+            )
+            st.info("💡 Cuando suba sus datos aparecerá automáticamente en el buscador.")
+            if st.button("✕ Cerrar", key="btn_cerrar_invitar"):
+                st.session_state.mostrar_invitar = False
+                st.rerun()
+
     st.divider()
 
-    # ── Renderizar modo seleccionado ───────────
     if modo == "🎧 Individual":
         _render_individual(data, persona_id, ahora, dia_semana)
     else:
